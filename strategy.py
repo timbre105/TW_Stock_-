@@ -1,5 +1,6 @@
 """分批進場策略邏輯:用歷史資料重播出目前策略狀態,並產生人看的訊號文字。"""
 import datetime as dt
+import pandas as pd
 from data_fetch import TAIPEI_OFFSET
 
 RESERVE = 200_000.0
@@ -36,7 +37,7 @@ def replay_strategy(df):
                     if not in_position:
                         in_position = True
                         cycle_start_date = row["date"]
-                    entries.append((row["date"], px, t_i + 1))
+                    entries.append((row["date"], px, t_i + 1, row["rolling_peak"], dd))
         if in_position and shares > 0:
             current_value = shares * row["p631"]
             unrealized_pct = (current_value / cost - 1) * 100 if cost > 0 else 0
@@ -96,3 +97,71 @@ def evaluate_signal(status, dd_now, p631_now):
         else:
             text = f"⚪ 空手,所有階段已用完,等待回撤修復到 {REARM_DD}% 以上重新解鎖"
             return {"kind": "idle", "text": text, "color": "gray", "notify_key": "idle_full"}
+
+
+def build_buy_sell_table(status, rolling_peak, dd_now, p631_now):
+    """組出「進出場策略總覽」表格,含分階買點與對應賣點,供畫面下方以 table 呈現。
+
+    entries 內每筆是 (日期, 00631L進場價, 階段, 進場當下的0050高點, 進場當下回撤%)。
+    """
+    rows = []
+    for i, (thresh, frac) in enumerate(TRANCHES):
+        target_50 = rolling_peak * (1 + thresh / 100)
+        stage_label = f"第{i + 1}階"
+        cond = f"回撤 ≤ {thresh:.0f}%"
+        triggered = status["triggered"][i]
+
+        entry_match = None
+        if triggered and status["in_position"] and status["cycle_start_date"] is not None:
+            candidates = [e for e in status["entries"]
+                          if e[2] == i + 1 and e[0] >= status["cycle_start_date"]]
+            if candidates:
+                entry_match = candidates[-1]
+
+        if entry_match:
+            e_date, e_price631, _stage, e_peak, e_dd = entry_match
+            status_text = "✅ 已觸發"
+            note = (f"{e_date.strftime('%Y-%m-%d')} 依高點 {e_peak:.2f} 回估(當時回撤 {e_dd:.1f}%),"
+                    f"00631L 進場價 {e_price631:.2f}")
+        elif not status["armed"]:
+            status_text = "🔒 鎖定中"
+            note = f"上一輪已出場,需回撤修復到 {REARM_DD:.0f}% 以上才重新解鎖"
+        else:
+            gap = dd_now - thresh  # 正值 = 還要再跌幾個百分點才會觸發
+            status_text = "⚪ 未觸發"
+            note = (f"依目前高點 {rolling_peak:.2f} 回估,目前回撤 {dd_now:.1f}%,"
+                    f"還要再跌 {gap:.1f} 個百分點") if gap > 0 else "條件已達成,等待下次刷新確認"
+
+        rows.append({
+            "類型": "買點", "階段": stage_label, "條件": cond,
+            "目標價位": f"{target_50:.2f}(0050)", "狀態": status_text, "備註": note,
+        })
+
+    if status["in_position"] and status["shares"] > 0:
+        avg_cost = status["cost"] / status["shares"]
+        unrealized_pct = (p631_now / avg_cost - 1) * 100
+        recover_price_50 = rolling_peak * (1 + EXIT_DD / 100)
+        take_profit_631 = avg_cost * (1 + EXIT_PROFIT_PCT / 100)
+        stop_loss_631 = avg_cost * (1 + STOP_LOSS_PCT / 100)
+        rows.append({
+            "類型": "賣點", "階段": "-", "條件": f"回撤修復至 {EXIT_DD:.0f}%",
+            "目標價位": f"{recover_price_50:.2f}(0050)", "狀態": "適用中",
+            "備註": f"目前回撤 {dd_now:.1f}%,均價(00631L) {avg_cost:.2f}",
+        })
+        rows.append({
+            "類型": "賣點", "階段": "-", "條件": f"未實現報酬達 +{EXIT_PROFIT_PCT:.0f}%",
+            "目標價位": f"{take_profit_631:.2f}(00631L)", "狀態": "適用中",
+            "備註": f"目前未實現 {unrealized_pct:+.1f}%,均價 {avg_cost:.2f}",
+        })
+        rows.append({
+            "類型": "賣點", "階段": "-", "條件": f"觸及停損 {STOP_LOSS_PCT:.0f}%",
+            "目標價位": f"{stop_loss_631:.2f}(00631L)", "狀態": "適用中",
+            "備註": f"均價(00631L) {avg_cost:.2f}",
+        })
+    else:
+        rows.append({
+            "類型": "賣點", "階段": "-", "條件": "-", "目標價位": "-",
+            "狀態": "目前無持倉", "備註": "尚未進場,暫無賣點目標",
+        })
+
+    return pd.DataFrame(rows, columns=["類型", "階段", "條件", "目標價位", "狀態", "備註"])

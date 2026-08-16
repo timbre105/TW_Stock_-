@@ -30,7 +30,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from data_fetch import fetch_history, fetch_realtime_quotes, is_market_hours, TAIPEI_OFFSET
-from strategy import replay_strategy, evaluate_signal, TRANCHES
+from strategy import replay_strategy, evaluate_signal, build_buy_sell_table, TRANCHES
 from notify import send_line_broadcast, notify_enabled
 import trades as trades_mod
 
@@ -288,6 +288,21 @@ def main():
                 "vol631", vol631_today, "inst_amt_631", last_row, "foreign_631", "trust_631", "dealer_631", last_date,
             )
             st.plotly_chart(panel_631, use_container_width=True)
+
+        st.subheader("📋 進出場策略總覽")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("目前最高點(0050)", f"{rolling_peak:.2f}")
+        m2.metric("目前回撤", f"{dd_now:.2f}%")
+        m3.metric("0050 現價", f"{p50_now:.2f}", f"{change50:+.2f}%")
+        m4.metric("00631L 現價", f"{p631_now:.2f}", f"{change631:+.2f}%")
+
+        table_df = build_buy_sell_table(status, rolling_peak, dd_now, p631_now)
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+        st.caption(
+            "「買點」依目前歷史高點回估三個分批進場門檻(-10% / -20% / -30%);"
+            "「賣點」只在有持倉時顯示,對應回撤修復、停利、停損三種出場條件,"
+            "任一條件先達成就出場。目標價位僅供參考,非即時精確報價。"
+        )
 
     with tab_trades:
         st.subheader("新增一筆交易紀錄")
