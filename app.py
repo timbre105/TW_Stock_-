@@ -36,11 +36,38 @@ import trades as trades_mod
 
 REFRESH_SECONDS = 30
 HISTORY_TTL = 4 * 3600
-CHART_LOOKBACK = 250
-VOL_LOOKBACK = 120
 STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "last_signal.json")
 
+# 圖表可選的顯示區間(天數,依日曆天數往回篩,不是交易日數)。
+# 「全部」用 None 代表不篩選,顯示 history 裡的所有資料。
+CHART_RANGE_OPTIONS = {
+    "1個月": 30,
+    "3個月": 90,
+    "6個月": 180,
+    "1年": 365,
+    "全部": None,
+}
+CHART_RANGE_DEFAULT = "3個月"
+
 st.set_page_config(page_title="0050 / 00631L 即時參考儀表板", layout="wide")
+
+# ------------------------- 手機版排版:螢幕寬度 <= 768px 時,把左右並排的欄位
+# (0050 / 00631L 圖表、交易紀錄表單、持倉摘要)自動改成上下堆疊,避免在手機
+# 瀏覽器上被壓成太窄看不清楚。純 CSS media query,不需要額外套件或 JS 偵測。
+st.markdown("""
+<style>
+@media (max-width: 768px) {
+  div[data-testid="stHorizontalBlock"] {
+    flex-direction: column !important;
+  }
+  div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+    width: 100% !important;
+    flex: 1 1 100% !important;
+    min-width: 100% !important;
+  }
+}
+</style>
+""", unsafe_allow_html=True)
 
 # 部署到 Streamlit Community Cloud 時,token 存在 st.secrets 裡而不是環境變數,
 # 這裡統一把 st.secrets 的值灌進 os.environ,本地 run.bat 跟雲端部署就能共用
@@ -72,58 +99,77 @@ def save_last_signal_key(key):
         json.dump({"notify_key": key, "updated_at": dt.datetime.now().isoformat()}, f)
 
 
-def build_price_chart(recent, live_points, code, price_col, rolling_peak=None, entries=None):
-    fig = go.Figure()
+def filter_by_days(history, days):
+    """依日曆天數篩選最近的資料;days 為 None 時回傳全部。"""
+    if days is None:
+        return history
+    cutoff = history["date"].max() - pd.Timedelta(days=days)
+    return history[history["date"] >= cutoff]
+
+
+def build_stock_panel(code, price_col, recent, live_points, rolling_peak, entries,
+                       vol_col, today_vol, amt_col, last_row, foreign_col, trust_col,
+                       dealer_col, last_date):
+    """把單一檔股票的價格/成交量/三大法人 3 張圖合併成一個直向 subplot,
+    並用 shared_xaxes 讓 X 軸(日期範圍)彼此同步縮放/平移。"""
+    avg_vol = recent[vol_col].mean()
+    inst_title = f"三大法人買賣超(約,萬元)"
+    if last_row is not None:
+        f_v = last_row[foreign_col] / 1000
+        t_v = last_row[trust_col] / 1000
+        d_v = last_row[dealer_col] / 1000
+        inst_title += f" — 最新({last_date}) 外資{f_v:+.0f}張 投信{t_v:+.0f}張 自營{d_v:+.0f}張"
+    else:
+        inst_title += " — 尚無法人資料"
+
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+        row_heights=[0.5, 0.25, 0.25],
+        subplot_titles=(code, f"成交量(張)" + (f"　今日累積 {today_vol:,.0f}張" if today_vol is not None else ""),
+                         inst_title),
+    )
+
+    # ---- row 1: 價格 ----
     fig.add_trace(go.Scatter(x=recent["date"], y=recent[price_col], mode="lines",
-                              name="收盤(歷史)", line=dict(color="steelblue", width=1)))
+                              name="收盤(歷史)", line=dict(color="steelblue", width=1)),
+                  row=1, col=1)
     if live_points:
         xs, ys = zip(*live_points)
         fig.add_trace(go.Scatter(x=list(xs), y=list(ys), mode="lines+markers",
-                                  name="今日即時", line=dict(color="red", width=2), marker=dict(size=4)))
+                                  name="今日即時", line=dict(color="red", width=2), marker=dict(size=4)),
+                      row=1, col=1)
     if rolling_peak is not None:
         fig.add_hline(y=rolling_peak, line_dash="dot", line_color="black", opacity=0.6,
-                       annotation_text="歷史高點")
+                       annotation_text="歷史高點", row=1, col=1)
         for thresh, frac in TRANCHES:
             level = rolling_peak * (1 + thresh / 100)
             fig.add_hline(y=level, line_dash="dash", line_color="gray", opacity=0.5,
-                           annotation_text=f"{thresh}%")
+                           annotation_text=f"{thresh}%", row=1, col=1)
     if entries:
         ex = [e[0] for e in entries if e[0] >= recent["date"].iloc[0]]
         ey = [e[1] for e in entries if e[0] >= recent["date"].iloc[0]]
         if ex:
             fig.add_trace(go.Scatter(x=ex, y=ey, mode="markers", name="進場點",
-                                      marker=dict(color="green", size=10, symbol="triangle-up")))
-    fig.update_layout(title=code, height=320, margin=dict(l=30, r=10, t=40, b=20),
-                       legend=dict(orientation="h", y=-0.2))
-    return fig
+                                      marker=dict(color="green", size=10, symbol="triangle-up")),
+                          row=1, col=1)
 
-
-def build_volume_chart(recent_vol, vol_col, code, today_vol):
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=recent_vol["date"], y=recent_vol[vol_col], name="成交量(張)",
-                          marker_color="slategray"))
-    avg_vol = recent_vol[vol_col].mean()
+    # ---- row 2: 成交量 ----
+    fig.add_trace(go.Bar(x=recent["date"], y=recent[vol_col], name="成交量(張)",
+                          marker_color="slategray", showlegend=False),
+                  row=2, col=1)
     fig.add_hline(y=avg_vol, line_dash="dash", line_color="orange",
-                   annotation_text=f"均量 {avg_vol:,.0f}張")
-    title = f"{code} 成交量(張)"
-    if today_vol is not None:
-        title += f"　今日累積 {today_vol:,.0f}張"
-    fig.update_layout(title=title, height=220, margin=dict(l=30, r=10, t=40, b=20), showlegend=False)
-    return fig
+                   annotation_text=f"均量 {avg_vol:,.0f}張", row=2, col=1)
 
+    # ---- row 3: 三大法人買賣超 ----
+    colors = ["seagreen" if v >= 0 else "crimson" for v in recent[amt_col]]
+    fig.add_trace(go.Bar(x=recent["date"], y=recent[amt_col], marker_color=colors,
+                          name="買賣超(萬元,估)", showlegend=False),
+                  row=3, col=1)
+    fig.add_hline(y=0, line_color="black", opacity=0.6, row=3, col=1)
 
-def build_inst_chart(recent_vol, amt_col, code, last_row, foreign_col, trust_col, dealer_col, last_date):
-    colors = ["seagreen" if v >= 0 else "crimson" for v in recent_vol[amt_col]]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=recent_vol["date"], y=recent_vol[amt_col], marker_color=colors, name="買賣超(萬元,估)"))
-    fig.add_hline(y=0, line_color="black", opacity=0.6)
-    if last_row is not None:
-        f_v, t_v, d_v = last_row[foreign_col] / 1000, last_row[trust_col] / 1000, last_row[dealer_col] / 1000
-        subtitle = f"最新({last_date}) 外資{f_v:+.0f}張 投信{t_v:+.0f}張 自營{d_v:+.0f}張"
-    else:
-        subtitle = "尚無法人資料"
-    fig.update_layout(title=f"{code} 三大法人買賣超(約,萬元) — {subtitle}",
-                       height=220, margin=dict(l=30, r=10, t=40, b=20), showlegend=False)
+    fig.update_layout(height=680, margin=dict(l=30, r=10, t=40, b=20),
+                       legend=dict(orientation="h", y=1.06, x=0),
+                       hovermode="x unified")
     return fig
 
 
@@ -213,26 +259,35 @@ def main():
         if notify_msg:
             st.caption(f"LINE 自動推播狀態: {notify_msg}")
 
+        range_choice = st.radio(
+            "圖表顯示區間", list(CHART_RANGE_OPTIONS.keys()),
+            index=list(CHART_RANGE_OPTIONS.keys()).index(CHART_RANGE_DEFAULT),
+            horizontal=True, key="chart_range",
+        )
+        chart_days = CHART_RANGE_OPTIONS[range_choice]
+        recent = filter_by_days(history, chart_days)
+
+        if recent.empty:
+            st.warning(f"「{range_choice}」區間內沒有資料,改用全部歷史資料顯示。")
+            recent = history
+
         c1, c2 = st.columns(2)
-        recent = history.tail(CHART_LOOKBACK)
-        recent_vol = history.tail(VOL_LOOKBACK)
+
+        last_row = history.dropna(subset=["inst_total_50"]).iloc[-1] if not history["inst_total_50"].isna().all() else None
+        last_date = last_row["date"].strftime("%Y-%m-%d") if last_row is not None else "無資料"
 
         with c1:
-            st.plotly_chart(build_price_chart(recent, st.session_state.live_points_50, "0050", "p50",
-                                               rolling_peak=rolling_peak), use_container_width=True)
-            st.plotly_chart(build_volume_chart(recent_vol, "vol50", "0050", vol50_today), use_container_width=True)
-            last_row = history.dropna(subset=["inst_total_50"]).iloc[-1] if not history["inst_total_50"].isna().all() else None
-            last_date = last_row["date"].strftime("%Y-%m-%d") if last_row is not None else "無資料"
-            st.plotly_chart(build_inst_chart(recent_vol, "inst_amt_50", "0050", last_row,
-                                              "foreign_50", "trust_50", "dealer_50", last_date),
-                             use_container_width=True)
+            panel_50 = build_stock_panel(
+                "0050", "p50", recent, st.session_state.live_points_50, rolling_peak, None,
+                "vol50", vol50_today, "inst_amt_50", last_row, "foreign_50", "trust_50", "dealer_50", last_date,
+            )
+            st.plotly_chart(panel_50, use_container_width=True)
         with c2:
-            st.plotly_chart(build_price_chart(recent, st.session_state.live_points_631, "00631L", "p631",
-                                               entries=status["entries"]), use_container_width=True)
-            st.plotly_chart(build_volume_chart(recent_vol, "vol631", "00631L", vol631_today), use_container_width=True)
-            st.plotly_chart(build_inst_chart(recent_vol, "inst_amt_631", "00631L", last_row,
-                                              "foreign_631", "trust_631", "dealer_631", last_date),
-                             use_container_width=True)
+            panel_631 = build_stock_panel(
+                "00631L", "p631", recent, st.session_state.live_points_631, None, status["entries"],
+                "vol631", vol631_today, "inst_amt_631", last_row, "foreign_631", "trust_631", "dealer_631", last_date,
+            )
+            st.plotly_chart(panel_631, use_container_width=True)
 
     with tab_trades:
         st.subheader("新增一筆交易紀錄")
